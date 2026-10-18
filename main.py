@@ -1,98 +1,169 @@
-import json
+"""Remote job market scraper: RemoteOK API -> pandas -> CSV / Excel report.
+
+Job data is provided by RemoteOK (https://remoteok.com).
+"""
+import html
+import sys
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+
 import httpx
-from bs4 import BeautifulSoup
 import pandas as pd
-from typing import List, Dict
+from bs4 import BeautifulSoup
 
-JOBS_API_URL = "https://remoteok.com/api"
+API_URL = "https://remoteok.com/api"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
+CSV_FILE = "remote_jobs_report.csv"
+XLSX_FILE = "remote_jobs_report.xlsx"
+SNIPPET_LENGTH = 200
 
-def fetch_job_data() -> List[Dict]:
-    """Скачивает свежие данные по вакансиям через HTTP-запрос с заголовками браузера."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    print("Sending HTTP request to job market API...")
-    try:
-        response = httpx.get(JOBS_API_URL, headers=headers, timeout=10.0, follow_redirects=True)
-        response.raise_for_status()
-        data = response.json()
-        return data[1:] if len(data) > 1 else []
-    except Exception as e:
-        print(f"Network error or rate limit hit: {e}. Generating fallback dataset for report...")
-        return [
-            {"position": "Backend Python Developer", "company": "TechCorp", "location": "Worldwide", "tags": ["python", "fastapi", "docker", "postgres"], "epoch": 1700000000},
-            {"position": "Senior Data Engineer", "company": "DataFlow Inc", "location": "USA / Remote", "tags": ["python", "sql", "pandas", "aws"], "epoch": 1700050000},
-            {"position": "Fullstack Software Engineer", "company": "CloudStart", "location": "Europe / Remote", "tags": ["python", "react", "typescript", "django"], "epoch": 1700100000},
-            {"position": "DevOps Engineer", "company": "ScaleUp Systems", "location": "Worldwide", "tags": ["docker", "kubernetes", "python", "terraform"], "epoch": 1700150000},
-            {"position": "Junior Python Developer", "company": "EduTech LLC", "location": "Remote", "tags": ["python", "sqlite", "git", "rest-api"], "epoch": 1700200000},
-        ]
+# Tags that describe a job category or seniority, not a technology.
+GENERIC_TAGS = {
+    "exec", "dev", "engineering", "senior", "junior", "non tech", "digital nomad",
+    "remote", "full time", "part time", "contract", "sales", "hr", "marketing",
+    "management", "support", "customer support", "operations", "admin", "finance",
+}
 
-def parse_and_clean_jobs(raw_jobs: List[Dict]) -> pd.DataFrame:
-    """Парсит данные, очищает их и формирует датафрейм Pandas."""
-    cleaned_data = []
+# Tags counted as programming languages in the "Top Languages" sheet.
+PROGRAMMING_LANGUAGES = {
+    "python", "javascript", "typescript", "java", "go", "golang", "rust", "ruby",
+    "php", "c++", "c#", "c", "kotlin", "swift", "scala", "sql", "r", "dart", "elixir",
+}
 
+
+def fetch_jobs() -> list[dict]:
+    """Download job postings from the RemoteOK API. Raises httpx.HTTPError on failure."""
+    response = httpx.get(API_URL, headers=HEADERS, timeout=15.0, follow_redirects=True)
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, list):
+        raise ValueError("Unexpected API response format")
+    # The first element of the feed is a legal notice, not a job.
+    return [item for item in data if isinstance(item, dict) and item.get("position")]
+
+
+def fix_mojibake(text: str) -> str:
+    """Repair text that was UTF-8 decoded as Windows-1252/Latin-1 (e.g. 'â€™')."""
+    for encoding in ("cp1252", "latin-1"):
+        try:
+            return text.encode(encoding).decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+    return text
+
+
+def clean_text(raw: str | None, limit: int = SNIPPET_LENGTH) -> str:
+    """Strip HTML (even if it was escaped twice), collapse whitespace, cut to `limit` chars."""
+    if not raw:
+        return ""
+    text = html.unescape(raw)
+    for _ in range(2):  # second pass handles HTML that was escaped inside the HTML
+        text = BeautifulSoup(text, "html.parser").get_text(separator=" ")
+        if "<" not in text:
+            break
+    text = fix_mojibake(" ".join(text.split()))
+    if len(text) > limit:
+        text = text[:limit].rsplit(" ", 1)[0] + "..."
+    return text
+
+
+def parse_jobs(raw_jobs: list[dict]) -> pd.DataFrame:
+    """Turn raw API items into a clean DataFrame."""
+    rows = []
     for item in raw_jobs:
-        position = item.get("position", "N/A")
-        company = item.get("company", "N/A")
-        location = item.get("location") or "Worldwide / Remote"
-        tags = item.get("tags", [])
-        
+        tags = item.get("tags") or []
         if isinstance(tags, str):
-            tags = [t.strip() for t in tags.split(",")]
-            
-        tags_str = ", ".join(tags) if tags else "N/A"
-        
-        raw_description = item.get("description", "")
-        clean_description = ""
-        if raw_description:
-            soup = BeautifulSoup(raw_description, "html.parser")
-            clean_description = soup.get_text(separator=" ").strip()[:200] + "..."
+            tags = tags.split(",")
+        tags = sorted({t.strip().lower() for t in tags if t and t.strip()})
 
-        cleaned_data.append({
-            "Job Title": position,
-            "Company": company,
-            "Location": location,
-            "Required Skills": tags_str,
-            "Description Snippet": clean_description if clean_description else "No description provided",
-            "Skill Count": len(tags)
-        })
+        posted = ""
+        if item.get("epoch"):
+            posted = datetime.fromtimestamp(int(item["epoch"]), tz=timezone.utc).strftime("%Y-%m-%d")
 
-    df = pd.DataFrame(cleaned_data)
-    return df
+        rows.append(
+            {
+                "Job Title": item.get("position", "N/A"),
+                "Company": item.get("company") or "N/A",
+                "Location": item.get("location") or "Worldwide",
+                "Posted": posted,
+                "Required Skills": ", ".join(tags),
+                "Skill Count": len(tags),
+                "Description Snippet": clean_text(item.get("description")) or "No description provided",
+                "URL": item.get("url") or item.get("apply_url") or "",
+            }
+        )
+    return pd.DataFrame(rows)
 
-def generate_reports(df: pd.DataFrame):
-    """Генерирует файлы отчетов в формате CSV и Excel с аналитикой."""
-    csv_file = "remote_jobs_report.csv"
-    excel_file = "remote_jobs_report.xlsx"
 
-    df.to_csv(csv_file, index=False, encoding="utf-8-sig")
-    print(f"[✓] CSV report saved to {csv_file}")
+def count_tags(df: pd.DataFrame, only: set[str] | None = None, exclude: set[str] | None = None) -> pd.DataFrame:
+    """Count how many job postings mention each tag (optionally filtered)."""
+    counter: Counter[str] = Counter()
+    for skills in df["Required Skills"]:
+        for tag in (s for s in skills.split(", ") if s):
+            if only is not None and tag not in only:
+                continue
+            if exclude is not None and tag in exclude:
+                continue
+            counter[tag] += 1
+    result = pd.DataFrame(counter.most_common(), columns=["Skill / Technology", "Job Postings"])
+    if not result.empty:
+        result["Share of Postings, %"] = (result["Job Postings"] / len(df) * 100).round(1)
+    return result
 
-    with pd.ExcelWriter(excel_file, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="All Jobs", index=False)
-        
-        all_skills = []
-        for skills in df["Required Skills"].dropna():
-            if skills != "N/A":
-                all_skills.extend([s.strip().lower() for s in skills.split(",")])
-        
-        skills_series = pd.Series(all_skills).value_counts().reset_index()
-        skills_series.columns = ["Skill / Technology", "Job Demand Count"]
-        
-        skills_series.to_excel(writer, sheet_name="Top Skills Demand", index=False)
 
-    print(f"[✓] Excel Analytics report saved to {excel_file}")
+def _format_sheet(worksheet) -> None:
+    """Freeze the header row and set readable column widths."""
+    worksheet.freeze_panes = "A2"
+    for column in worksheet.columns:
+        longest = max(len(str(cell.value)) if cell.value is not None else 0 for cell in column)
+        worksheet.column_dimensions[column[0].column_letter].width = min(longest + 2, 60)
 
-def main():
-    print("=== Starting Remote Job Market Scraper & Analytics Pipeline ===")
-    raw_jobs = fetch_job_data()
-    print(f"Fetched {len(raw_jobs)} job postings.")
-    
-    df = parse_and_clean_jobs(raw_jobs)
-    print(f"Successfully cleaned and structured {len(df)} records.")
-    
-    generate_reports(df)
-    print("=== Pipeline Execution Complete! ===")
+
+def save_reports(df: pd.DataFrame, out_dir: Path = Path(".")) -> None:
+    """Write CSV and a multi-sheet Excel workbook with demand analytics."""
+    csv_path = out_dir / CSV_FILE
+    xlsx_path = out_dir / XLSX_FILE
+
+    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    print(f"CSV report saved to {csv_path}")
+
+    sheets = {
+        "All Jobs": df,
+        "Top Skills": count_tags(df, exclude=GENERIC_TAGS),
+        "Top Languages": count_tags(df, only=PROGRAMMING_LANGUAGES),
+    }
+    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+        for name, frame in sheets.items():
+            frame.to_excel(writer, sheet_name=name, index=False)
+            _format_sheet(writer.sheets[name])
+    print(f"Excel report saved to {xlsx_path}")
+
+
+def main() -> None:
+    print("Downloading job postings from RemoteOK...")
+    try:
+        raw_jobs = fetch_jobs()
+    except (httpx.HTTPError, ValueError) as error:
+        print(f"Could not fetch job data: {error}", file=sys.stderr)
+        sys.exit(1)
+
+    if not raw_jobs:
+        print("The API returned no job postings.", file=sys.stderr)
+        sys.exit(1)
+
+    df = parse_jobs(raw_jobs)
+    print(f"Fetched and cleaned {len(df)} job postings.")
+    save_reports(df)
+
+    top = count_tags(df, only=PROGRAMMING_LANGUAGES).head(5)
+    if not top.empty:
+        print("\nTop programming languages in demand:")
+        print(top.to_string(index=False))
+
 
 if __name__ == "__main__":
     main()

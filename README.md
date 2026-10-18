@@ -1,46 +1,38 @@
-# Remote Job Market Scraper & Data Analytics Tool
+# Remote Job Market Scraper
 
-An automated Python ETL (Extract, Transform, Load) pipeline that scrapes global remote tech job postings, parses raw HTML/JSON market data, cleanses text attributes, and exports analytical reports into CSV and structured Excel workbooks.
+A small Python ETL script: it downloads remote tech job postings from the
+[RemoteOK](https://remoteok.com) public API, cleans the data with pandas and exports
+demand reports to CSV and Excel.
 
-## Key Features
-- **HTTP Data Extraction:** Reliable network fetching using `httpx` with customized User-Agent headers and exception handling.
-- **HTML/JSON Parsing:** Utilizes `BeautifulSoup4` to strip HTML tags and extract clean text summaries.
-- **Data Transformation with Pandas:** Structures raw JSON feeds into Pandas DataFrames, handling missing values and aggregating skill tags.
-- **Automated Analytics & Reporting:** Generates demand frequency tables for top programming languages and exports results into multi-sheet Excel workbooks (`.xlsx`) and UTF-8 encoded `.csv` files.
+Job data is provided by RemoteOK.
 
-## Tech Stack
-- **Language:** Python 3.10+
-- **HTTP Client:** HTTPX
-- **HTML Parser:** BeautifulSoup4
-- **Data Processing:** Pandas
-- **Excel Engine:** OpenPyXL
+## What it does
+1. **Extract:** fetches postings with `httpx` (the script stops with an error message if the request fails, no fake data is generated).
+2. **Transform:** strips HTML from descriptions with BeautifulSoup (including double-escaped HTML), fixes broken encoding, normalizes and deduplicates tags, converts timestamps to dates.
+3. **Load:** writes `remote_jobs_report.csv` and `remote_jobs_report.xlsx` with three sheets:
+   - **All Jobs** - cleaned postings (title, company, location, date, skills, snippet, URL)
+   - **Top Skills** - most mentioned technologies (generic tags like "exec" or "sales" are excluded)
+   - **Top Languages** - most requested programming languages
 
 ## Quickstart
+```bash
+git clone https://github.com/krankenwagenpro/job-analytics-parser.git
+cd job-analytics-parser
+python -m venv .venv
+.venv\Scripts\activate        # Linux/macOS: source .venv/bin/activate
+pip install -r requirements.txt
+python main.py
+```
 
-1. **Clone the repository:**
-   ```bash
-   git clone https://github.com/YOUR_USERNAME/job-analytics-parser.git
-   cd job-analytics-parser
-   ```
+## Tests
+```bash
+pytest
+```
+Tests cover text cleaning, parsing of incomplete data, tag counting and report generation (no network needed).
 
-2. **Set up virtual environment:**
-   ```bash
-   python -m venv .venv
-   # Windows:
-   .venv\Scripts\activate
-   # macOS/Linux:
-   source .venv/bin/activate
-   ```
+## Tech stack
+Python 3.10+, httpx, BeautifulSoup4, pandas, openpyxl, pytest
 
-3. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. **Run the parser:**
-   ```bash
-   python main.py
-   ```
-
-5. **View Outputs:**
-   Check generated `remote_jobs_report.csv` and `remote_jobs_report.xlsx` in the project root directory.
+## Limitations
+The language/skill lists are simple whitelists, and the tags come from the source as is,
+so the statistics describe RemoteOK postings only, not the whole job market.
